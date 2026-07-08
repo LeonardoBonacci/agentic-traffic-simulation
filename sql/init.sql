@@ -49,17 +49,21 @@ CREATE INDEX idx_edges_target ON edges (target_node);
 -- ============================================================
 
 CREATE TABLE agents (
-    agent_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_id      SERIAL PRIMARY KEY,
+    name          TEXT NOT NULL,
     agent_type    TEXT NOT NULL DEFAULT 'vehicle',  -- vehicle, pedestrian, cyclist
+    current_node  BIGINT NOT NULL REFERENCES nodes(node_id),
+    target_node   BIGINT REFERENCES nodes(node_id),
     current_edge  INTEGER REFERENCES edges(edge_id),
     position_on_edge DOUBLE PRECISION DEFAULT 0.0,  -- 0.0 to 1.0 fraction along edge
-    speed_mps     DOUBLE PRECISION DEFAULT 0.0,     -- current speed in m/s
+    speed_kmh     DOUBLE PRECISION DEFAULT 50.0,
     heading       DOUBLE PRECISION DEFAULT 0.0,     -- degrees from north
     geom          GEOMETRY(Point, 4326),            -- current location
-    status        TEXT DEFAULT 'idle',              -- idle, moving, stopped
+    status        TEXT DEFAULT 'idle',              -- idle, moving, arrived
     created_at    TIMESTAMPTZ DEFAULT now(),
     updated_at    TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX idx_agents_geom ON agents USING GIST (geom);
 CREATE INDEX idx_agents_edge ON agents (current_edge);
+CREATE INDEX idx_agents_node ON agents (current_node);
