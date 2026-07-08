@@ -24,7 +24,9 @@ python3 scripts/orchestrator.py
 
 - **Database:** PostGIS with `nodes` (intersections), `edges` (road segments), and `agents` (vehicles)
 - **Ingestion:** `scripts/ingest_graphml.py` parses OSMnx GraphML and loads the road network
-- **Orchestrator:** `scripts/orchestrator.py` runs a tick-based simulation loop where each vehicle advances one edge per tick via random outgoing edge selection
+- **Orchestrator:** `scripts/orchestrator.py` runs a tick-based simulation loop with:
+  - **Weighted random turns** — vehicles prefer going straight (weight 5) over slight turns (3.5), moderate turns (2), sharp turns (1), and U-turns (0.2)
+  - **Give way to left** — when multiple vehicles target the same intersection, approach bearings are computed from PostGIS coordinates; a vehicle yields if another is approaching from its left
 
 ## Data Model
 
