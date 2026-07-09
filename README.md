@@ -7,7 +7,7 @@ The street network is static — loaded once from OpenStreetMap data. Agents are
 ## Setup
 
 ```bash
-# 1. Start PostGIS
+# 1. Start PostGIS + Dekart map viewer
 docker compose up -d
 
 # 2. Install Python deps
@@ -21,7 +21,18 @@ python3 scripts/ingest_graphml.py
 
 # 5. Run the simulation
 python3 scripts/orchestrator.py
+
+# 6. Open Dekart to view the map
+open http://localhost:8080
 ```
+
+## Monitoring (Dekart)
+
+[Dekart](https://github.com/dekart-xyz/dekart) provides a Kepler.gl map UI connected directly to the PostGIS database. Open **http://localhost:8080**, create a new report, and paste queries from `sql/dekart-queries.sql` to visualize:
+
+- **Street network** — all road segments colored by speed or type
+- **Live agents** — vehicle positions updated each simulation tick
+- **Intersections** — node layer showing junctions and traffic signals
 
 ## Architecture
 

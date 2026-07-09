@@ -109,13 +109,16 @@ def get_node_coords(conn, node_id):
 
 
 def update_agent_position(conn, agent_id, new_node, status="moving"):
-    """Update an agent's current node in the database."""
+    """Update an agent's current node and geom in the database."""
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE agents
-            SET current_node = %s, status = %s, updated_at = now()
+            SET current_node = %s,
+                status = %s,
+                geom = (SELECT geom FROM nodes WHERE node_id = %s),
+                updated_at = now()
             WHERE agent_id = %s
-        """, (new_node, status, agent_id))
+        """, (new_node, status, new_node, agent_id))
     conn.commit()
 
 

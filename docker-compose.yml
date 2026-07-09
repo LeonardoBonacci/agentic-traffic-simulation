@@ -19,5 +19,22 @@ services:
       timeout: 5s
       retries: 5
 
+  dekart:
+    image: dekartxyz/dekart:latest
+    container_name: traffic-sim-dekart
+    environment:
+      DEKART_DATASOURCE: PG
+      DEKART_POSTGRES_DATASOURCE_CONNECTION: postgres://traffic:traffic123@postgres:5432/traffic_sim?sslmode=disable
+      DEKART_PORT: "8080"
+      DEKART_MAPBOX_TOKEN: ""
+    ports:
+      - "8080:8080"
+    volumes:
+      - dekart-data:/dekart/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   pgdata:
+  dekart-data:
