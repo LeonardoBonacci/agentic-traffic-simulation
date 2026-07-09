@@ -12,9 +12,7 @@ SELECT
     highway AS type,
     speed_kph AS speed,
     length_m,
-    NULL::double precision AS heading,
     NULL AS status,
-    NULL::integer AS street_count,
     NULL::integer AS congestion,
     ST_AsGeoJSON(geom)::json AS geometry
 FROM edges
@@ -29,9 +27,7 @@ SELECT
     agent_type AS type,
     speed_kmh AS speed,
     NULL AS length_m,
-    heading,
     status,
-    NULL AS street_count,
     NULL AS congestion,
     ST_AsGeoJSON(geom)::json AS geometry
 FROM agents
@@ -42,14 +38,12 @@ UNION ALL
 SELECT
     'node' AS layer,
     node_id::text AS id,
-    osm_highway AS name,
+    NULL AS name,
     'intersection' AS type,
     NULL AS speed,
     NULL AS length_m,
-    NULL AS heading,
     NULL AS status,
-    street_count,
-    agents_near_node(node_id, 100) AS congestion,
+    NULL AS congestion,
     ST_AsGeoJSON(geom)::json AS geometry
 FROM nodes;
 

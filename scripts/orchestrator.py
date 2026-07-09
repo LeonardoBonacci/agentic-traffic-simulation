@@ -15,8 +15,9 @@ Usage:
 
 import json
 import random
+import select
+import threading
 import time
-from collections import defaultdict
 
 import psycopg2
 import requests
@@ -166,6 +167,58 @@ def update_agent_position(conn, agent_id, new_node, status="moving"):
             WHERE agent_id = %s
         """, (new_node, status, new_node, agent_id))
     conn.commit()
+
+
+# ─── Pub/Sub: listen for vehicle movement broadcasts via PG LISTEN ───────────
+
+class VehicleRadio:
+    """
+    Background listener for PG NOTIFY on the 'vehicle_moves' channel.
+    Collects broadcasts; the orchestrator drains and prints them each tick.
+    """
+
+    def __init__(self):
+        self._messages = []
+        self._lock = threading.Lock()
+        self._conn = None
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._conn = psycopg2.connect(**DB_CONFIG)
+        self._conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+        with self._conn.cursor() as cur:
+            cur.execute("LISTEN vehicle_moves")
+        self._running = True
+        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._thread.start()
+
+    def _listen_loop(self):
+        while self._running:
+            if select.select([self._conn], [], [], 0.2) != ([], [], []):
+                self._conn.poll()
+                while self._conn.notifies:
+                    notify = self._conn.notifies.pop(0)
+                    try:
+                        data = json.loads(notify.payload)
+                    except (json.JSONDecodeError, TypeError):
+                        data = {"raw": notify.payload}
+                    with self._lock:
+                        self._messages.append(data)
+
+    def drain(self):
+        """Return and clear all accumulated messages."""
+        with self._lock:
+            msgs = self._messages[:]
+            self._messages.clear()
+        return msgs
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1)
+        if self._conn:
+            self._conn.close()
 
 
 # ─── Tool execution ──────────────────────────────────────────────────────────
@@ -442,6 +495,12 @@ def run_simulation():
     """Main orchestrator: thin tick-loop with parallel autonomous agents."""
     conn = get_connection()
 
+    # Start the pub/sub radio listener
+    radio = VehicleRadio()
+    radio.start()
+    print("📻 Vehicle radio listening on channel 'vehicle_moves'...")
+    print()
+
     print("=" * 60)
     print("  AUTONOMOUS VEHICLE SIMULATION (Tool-Calling Agents)")
     print("=" * 60)
@@ -507,6 +566,16 @@ def run_simulation():
             print(f"  [{name}] -> node {node_id} [{status}]")
             print(f"    reasoning: {summary or 'direct move'}")
 
+        # Drain and print radio broadcasts received this tick
+        time.sleep(0.1)  # small pause to let notifications arrive
+        broadcasts = radio.drain()
+        if broadcasts:
+            print(f"  {'·' * 40}")
+            print(f"  📻 Radio chatter this tick:")
+            for msg in broadcasts:
+                print(f"     {msg['vehicle']} entered \"{msg['road']}\" "
+                      f"(node {msg['from']} → {msg['to']})")
+
         print()
         time.sleep(TICK_INTERVAL)
 
@@ -523,6 +592,7 @@ def run_simulation():
         marker = "OK" if a["status"] == "arrived" else ".."
         print(f"  [{marker}] {a['name']}: node {a['current_node']} [{a['status']}]{dist_str}")
 
+    radio.stop()
     conn.close()
 
 

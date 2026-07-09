@@ -68,6 +68,42 @@ CREATE INDEX idx_trails_agent ON agent_trails (agent_id);
 CREATE INDEX idx_trails_geom ON agent_trails USING GIST (geom);
 
 -- ============================================================
+-- PUB/SUB: auto-broadcast vehicle movements via PG NOTIFY
+-- ============================================================
+
+-- Trigger function: fires NOTIFY when a vehicle changes current_node
+CREATE OR REPLACE FUNCTION notify_vehicle_move() RETURNS trigger AS $$
+DECLARE
+    road_name TEXT;
+BEGIN
+    -- Only fire if current_node actually changed
+    IF OLD.current_node IS DISTINCT FROM NEW.current_node THEN
+        -- Look up the road name between old and new node
+        SELECT COALESCE(e.name, e.highway, 'unnamed road') INTO road_name
+        FROM edges e
+        WHERE (e.source_node = OLD.current_node AND e.target_node = NEW.current_node)
+           OR (e.target_node = OLD.current_node AND e.source_node = NEW.current_node AND e.oneway = FALSE)
+        LIMIT 1;
+
+        PERFORM pg_notify('vehicle_moves', json_build_object(
+            'vehicle', NEW.name,
+            'from', OLD.current_node,
+            'to', NEW.current_node,
+            'road', COALESCE(road_name, 'unnamed road'),
+            'status', NEW.status
+        )::text);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_vehicle_move
+    AFTER UPDATE ON agents
+    FOR EACH ROW
+    WHEN (OLD.current_node IS DISTINCT FROM NEW.current_node)
+    EXECUTE FUNCTION notify_vehicle_move();
+
+-- ============================================================
 -- SPATIAL HELPER FUNCTIONS
 -- ============================================================
 
