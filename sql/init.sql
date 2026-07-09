@@ -1,5 +1,6 @@
--- Enable PostGIS extension
+-- Enable PostGIS and pgRouting extensions
 CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS pgrouting;
 
 -- ============================================================
 -- STATIC STREET MAP TABLES (read once at simulation start)
@@ -67,3 +68,148 @@ CREATE TABLE agents (
 CREATE INDEX idx_agents_geom ON agents USING GIST (geom);
 CREATE INDEX idx_agents_edge ON agents (current_edge);
 CREATE INDEX idx_agents_node ON agents (current_node);
+
+-- ============================================================
+-- AGENT TRAIL TABLE (historical positions for analytics)
+-- ============================================================
+
+CREATE TABLE agent_trails (
+    trail_id      SERIAL PRIMARY KEY,
+    agent_id      INTEGER NOT NULL REFERENCES agents(agent_id),
+    tick          INTEGER NOT NULL,
+    node_id       BIGINT NOT NULL REFERENCES nodes(node_id),
+    geom          GEOMETRY(Point, 4326),
+    recorded_at   TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_trails_agent ON agent_trails (agent_id);
+CREATE INDEX idx_trails_geom ON agent_trails USING GIST (geom);
+
+-- ============================================================
+-- SPATIAL HELPER FUNCTIONS
+-- ============================================================
+
+-- Distance (meters) between two nodes
+CREATE OR REPLACE FUNCTION node_distance_m(node_a BIGINT, node_b BIGINT)
+RETURNS DOUBLE PRECISION AS $$
+    SELECT ST_Distance(
+        (SELECT geom::geography FROM nodes WHERE node_id = node_a),
+        (SELECT geom::geography FROM nodes WHERE node_id = node_b)
+    );
+$$ LANGUAGE SQL STABLE;
+
+-- Bearing (degrees) from node A to node B
+CREATE OR REPLACE FUNCTION node_bearing(node_a BIGINT, node_b BIGINT)
+RETURNS DOUBLE PRECISION AS $$
+    SELECT degrees(ST_Azimuth(
+        (SELECT geom FROM nodes WHERE node_id = node_a),
+        (SELECT geom FROM nodes WHERE node_id = node_b)
+    ));
+$$ LANGUAGE SQL STABLE;
+
+-- Count agents within a radius (meters) of a node
+CREATE OR REPLACE FUNCTION agents_near_node(nid BIGINT, radius_m DOUBLE PRECISION)
+RETURNS INTEGER AS $$
+    SELECT count(*)::integer
+    FROM agents a, nodes n
+    WHERE n.node_id = nid
+      AND a.geom IS NOT NULL
+      AND ST_DWithin(a.geom::geography, n.geom::geography, radius_m);
+$$ LANGUAGE SQL STABLE;
+
+-- Count agents on a specific edge (within corridor buffer)
+CREATE OR REPLACE FUNCTION agents_on_edge(eid INTEGER, buffer_m DOUBLE PRECISION DEFAULT 15.0)
+RETURNS INTEGER AS $$
+    SELECT count(*)::integer
+    FROM agents a, edges e
+    WHERE e.edge_id = eid
+      AND a.geom IS NOT NULL
+      AND e.geom IS NOT NULL
+      AND ST_DWithin(a.geom::geography, e.geom::geography, buffer_m);
+$$ LANGUAGE SQL STABLE;
+
+-- Get candidate edges with spatial enrichment (distance to target, congestion)
+CREATE OR REPLACE FUNCTION enriched_outgoing_edges(
+    from_node BIGINT,
+    target_node BIGINT
+)
+RETURNS TABLE (
+    edge_id       INTEGER,
+    source_node   BIGINT,
+    target_node_  BIGINT,
+    name          TEXT,
+    highway       TEXT,
+    length_m      DOUBLE PRECISION,
+    speed_kph     DOUBLE PRECISION,
+    dist_to_target_m DOUBLE PRECISION,
+    bearing_to_target DOUBLE PRECISION,
+    edge_bearing  DOUBLE PRECISION,
+    congestion    INTEGER
+) AS $$
+    SELECT
+        e.edge_id,
+        e.source_node,
+        e.target_node,
+        e.name,
+        e.highway,
+        e.length_m,
+        e.speed_kph,
+        -- How far is this edge's target from our destination?
+        ST_Distance(
+            (SELECT geom::geography FROM nodes WHERE node_id = e.target_node),
+            (SELECT geom::geography FROM nodes WHERE node_id = target_node)
+        ) AS dist_to_target_m,
+        -- Bearing from edge target toward our destination
+        degrees(ST_Azimuth(
+            (SELECT geom FROM nodes WHERE node_id = e.target_node),
+            (SELECT geom FROM nodes WHERE node_id = target_node)
+        )) AS bearing_to_target,
+        -- Bearing of this edge segment
+        degrees(ST_Azimuth(
+            (SELECT geom FROM nodes WHERE node_id = e.source_node),
+            (SELECT geom FROM nodes WHERE node_id = e.target_node)
+        )) AS edge_bearing,
+        -- Number of vehicles currently on/near this edge
+        (SELECT count(*)::integer FROM agents a
+         WHERE a.geom IS NOT NULL AND e.geom IS NOT NULL
+         AND ST_DWithin(a.geom::geography, e.geom::geography, 20.0)
+        ) AS congestion
+    FROM edges e
+    WHERE e.source_node = from_node;
+$$ LANGUAGE SQL STABLE;
+
+-- Shortest-path cost (total meters) using Dijkstra
+CREATE OR REPLACE FUNCTION shortest_path_cost(
+    start_node BIGINT,
+    end_node BIGINT
+)
+RETURNS DOUBLE PRECISION AS $$
+DECLARE
+    total_cost DOUBLE PRECISION;
+BEGIN
+    SELECT sum(cost) INTO total_cost
+    FROM pgr_dijkstra(
+        'SELECT edge_id AS id, source_node AS source, target_node AS target, length_m AS cost, CASE WHEN oneway THEN -1 ELSE length_m END AS reverse_cost FROM edges',
+        start_node,
+        end_node,
+        directed := true
+    );
+    RETURN total_cost;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Shortest-path sequence (list of edge IDs)
+CREATE OR REPLACE FUNCTION shortest_path_edges(
+    start_node BIGINT,
+    end_node BIGINT
+)
+RETURNS TABLE (seq INTEGER, edge_id BIGINT, node_id BIGINT, cost DOUBLE PRECISION) AS $$
+    SELECT seq::integer, edge AS edge_id, node AS node_id, cost
+    FROM pgr_dijkstra(
+        'SELECT edge_id AS id, source_node AS source, target_node AS target, length_m AS cost, CASE WHEN oneway THEN -1 ELSE length_m END AS reverse_cost FROM edges',
+        start_node,
+        end_node,
+        directed := true
+    )
+    ORDER BY seq;
+$$ LANGUAGE SQL STABLE;

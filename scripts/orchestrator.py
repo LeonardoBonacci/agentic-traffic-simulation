@@ -2,9 +2,12 @@
 Traffic Simulation Orchestrator
 
 A loop that moves vehicles step-by-step over the road network.
-Each tick, every vehicle advances to the next node along a weighted-random
-outgoing edge from its current position.  Vehicles must give way to
-traffic approaching an intersection from their left side.
+Each tick, every vehicle uses PostGIS spatial intelligence to navigate:
+  - pgRouting Dijkstra shortest-path to compute optimal routes
+  - ST_Distance / ST_DWithin for congestion detection and avoidance
+  - Enriched edge queries with distance-to-target, bearing, and congestion
+  - LLM receives full spatial context (not just street names)
+  - pgRouting Dijkstra for optimal route planning
 
 Usage:
     python3 scripts/orchestrator.py
@@ -16,6 +19,7 @@ import random
 import re
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import psycopg2
 import requests
@@ -36,7 +40,7 @@ MAX_TICKS = 20       # run for this many steps then stop
 
 OLLAMA_MODEL = "qwen3:8b"
 OLLAMA_URL = "http://localhost:11434/api/chat"
-USE_LLM = True  # set False to fall back to weighted-random only
+USE_LLM = True  # set False to fall back to spatial-weighted only
 
 
 # ─── LLM helper ──────────────────────────────────────────────────────────────
@@ -51,8 +55,8 @@ def llm_chat(system_prompt, user_prompt):
         ],
         "stream": False,
         "think": False,
-        "options": {"temperature": 0.4, "num_predict": 32},
-    }, timeout=15)
+        "options": {"temperature": 0.4, "num_predict": 8},
+    }, timeout=10)
     resp.raise_for_status()
     return resp.json()["message"]["content"].strip()
 
@@ -108,6 +112,107 @@ def get_node_coords(conn, node_id):
         return None, None
 
 
+# ─── PostGIS Spatial Intelligence ────────────────────────────────────────────
+
+def get_enriched_edges(conn, from_node, target_node):
+    """
+    Get outgoing edges enriched with PostGIS spatial data:
+    - distance from each candidate's endpoint to the agent's target
+    - bearing toward target
+    - edge bearing (direction of travel)
+    - congestion count (vehicles currently on/near the edge)
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT * FROM enriched_outgoing_edges(%s, %s)
+        """, (from_node, target_node))
+        return cur.fetchall()
+
+
+def get_shortest_path(conn, from_node, target_node):
+    """
+    Use pgRouting Dijkstra to compute the shortest path.
+    Returns list of (edge_id, node_id, cost) or empty list if no path.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            cur.execute("""
+                SELECT seq, edge_id, node_id, cost
+                FROM shortest_path_edges(%s, %s)
+            """, (from_node, target_node))
+            return cur.fetchall()
+        except Exception:
+            conn.rollback()
+            return []
+
+
+def get_shortest_path_cost(conn, from_node, target_node):
+    """Get total shortest-path distance in meters via pgRouting."""
+    with conn.cursor() as cur:
+        try:
+            cur.execute("SELECT shortest_path_cost(%s, %s)", (from_node, target_node))
+            result = cur.fetchone()
+            return result[0] if result and result[0] else None
+        except Exception:
+            conn.rollback()
+            return None
+
+
+def get_congestion_at_node(conn, node_id, radius_m=100.0):
+    """Count vehicles near a node using ST_DWithin (geography)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT agents_near_node(%s, %s)", (node_id, radius_m))
+        return cur.fetchone()[0]
+
+
+def get_congestion_on_edge(conn, edge_id):
+    """Count vehicles on/near a specific edge using ST_DWithin."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT agents_on_edge(%s)", (edge_id,))
+        return cur.fetchone()[0]
+
+
+def get_nearby_agents(conn, node_id, radius_m=200.0):
+    """Get details of nearby agents within radius (for situational awareness)."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT a.agent_id, a.name, a.current_node, a.status, a.speed_kmh,
+                   ST_Distance(a.geom::geography, n.geom::geography) AS distance_m
+            FROM agents a, nodes n
+            WHERE n.node_id = %s
+              AND a.geom IS NOT NULL
+              AND ST_DWithin(a.geom::geography, n.geom::geography, %s)
+            ORDER BY distance_m
+        """, (node_id, radius_m))
+        return cur.fetchall()
+
+
+def get_distance_to_target(conn, from_node, target_node):
+    """Straight-line distance (meters) between two nodes using PostGIS geography."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT node_distance_m(%s, %s)", (from_node, target_node))
+        result = cur.fetchone()
+        return result[0] if result else None
+
+
+def get_bearing_to_target(conn, from_node, target_node):
+    """Bearing (degrees from north) from from_node to target_node."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT node_bearing(%s, %s)", (from_node, target_node))
+        result = cur.fetchone()
+        return result[0] if result else None
+
+
+def record_trail(conn, agent_id, tick, node_id):
+    """Record agent position in the trail table for later analytics."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO agent_trails (agent_id, tick, node_id, geom)
+            VALUES (%s, %s, %s, (SELECT geom FROM nodes WHERE node_id = %s))
+        """, (agent_id, tick, node_id, node_id))
+    conn.commit()
+
+
 def update_agent_position(conn, agent_id, new_node, status="moving"):
     """Update an agent's current node and geom in the database."""
     with conn.cursor() as cur:
@@ -151,219 +256,215 @@ def angle_difference(bearing1, bearing2):
 def is_approaching_from_left(my_approach_bearing, other_approach_bearing):
     """
     Determine if another vehicle is approaching the intersection from my left.
-    my_approach_bearing: the direction I'm travelling INTO the intersection.
-    other_approach_bearing: the direction they're travelling INTO the intersection.
-
-    "From my left" means the other vehicle's arrival direction is roughly
-    to the left of my direction of travel (between -30° and -150° relative).
     """
-    # Reverse the other's bearing to get direction FROM which they arrive
     other_from = (other_approach_bearing + 180) % 360
     diff = angle_difference(my_approach_bearing, other_from)
-    # Negative diff = to my left
     return -150 <= diff <= -30
 
 
-# ─── Turn weighting ─────────────────────────────────────────────────────────
-
-def weight_edges_by_turn(conn, from_node, edges):
-    """
-    Weight outgoing edges based on how much turning is required.
-    Strongly prefers going straight, discourages U-turns.
-    Returns list of (edge, weight) tuples.
-    """
-    if not edges:
-        return []
-
-    from_lon, from_lat = get_node_coords(conn, from_node)
-    if from_lon is None:
-        # Can't compute geometry — equal weights
-        return [(e, 1.0) for e in edges]
-
-    # Our approach bearing into from_node is unknown without previous node,
-    # so we weight relative to each other (uniform if no geometry)
-    # We'll compute target bearings from from_node to each edge target
-    weighted = []
-    for e in edges:
-        target = e["target_node"]
-        t_lon, t_lat = get_node_coords(conn, target)
-        if t_lon is None:
-            weighted.append((e, 1.0))
-        else:
-            weighted.append((e, 1.0))  # base weight
-
-    return weighted
-
-
-def weight_edges_with_history(conn, prev_node, current_node, edges):
-    """
-    Weight edges considering the direction we came from (prev_node -> current_node).
-    Prefers continuing straight, penalises U-turns.
-    """
-    if not edges or prev_node is None:
-        return [(e, 1.0) for e in edges]
-
-    prev_lon, prev_lat = get_node_coords(conn, prev_node)
-    cur_lon, cur_lat = get_node_coords(conn, current_node)
-
-    if prev_lon is None or cur_lon is None:
-        return [(e, 1.0) for e in edges]
-
-    # Bearing we arrived from
-    arrival_bearing = compute_bearing(prev_lon, prev_lat, cur_lon, cur_lat)
-
-    weighted = []
-    for e in edges:
-        target = e["target_node"]
-        t_lon, t_lat = get_node_coords(conn, target)
-        if t_lon is None:
-            weighted.append((e, 1.0))
-            continue
-
-        exit_bearing = compute_bearing(cur_lon, cur_lat, t_lon, t_lat)
-        turn_angle = abs(angle_difference(arrival_bearing, exit_bearing))
-
-        # Weight: straight (0°) = 5, slight turn (45°) = 4, right angle (90°) = 2, U-turn (180°) = 0.2
-        if turn_angle <= 30:
-            w = 5.0   # straight ahead
-        elif turn_angle <= 60:
-            w = 3.5   # slight turn
-        elif turn_angle <= 100:
-            w = 2.0   # moderate turn
-        elif turn_angle <= 140:
-            w = 1.0   # sharp turn
-        else:
-            w = 0.2   # U-turn (very unlikely)
-
-        weighted.append((e, w))
-
-    return weighted
-
-
-# ─── Vehicle state (previous node tracking) ─────────────────────────────────
+# ─── Spatial route planning ──────────────────────────────────────────────────
 
 # Maps agent_id -> previous_node (to compute approach bearing)
 agent_prev_node = {}
 
-
-INITIAL_VEHICLES = [
-    ("car_alpha",   40.0),
-    ("car_bravo",   50.0),
-    ("car_charlie", 45.0),
-    ("car_delta",   55.0),
-    ("car_echo",    35.0),
-]
+# Maps agent_id -> cached shortest path (list of node_ids)
+agent_planned_route = {}
 
 
-def seed_vehicles(conn):
-    """Insert initial vehicles if none exist, using random start/target nodes."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM agents WHERE agent_type = 'vehicle'")
-        count = cur.fetchone()[0]
-        if count > 0:
-            return  # already seeded
-
-        for name, speed in INITIAL_VEHICLES:
-            cur.execute("""
-                INSERT INTO agents (name, agent_type, current_node, target_node, speed_kmh)
-                VALUES (%s, 'vehicle',
-                        (SELECT node_id FROM nodes ORDER BY random() LIMIT 1),
-                        (SELECT node_id FROM nodes ORDER BY random() LIMIT 1),
-                        %s)
-            """, (name, speed))
-    conn.commit()
-    print(f"Seeded {len(INITIAL_VEHICLES)} vehicles.\n")
-
-
-def pick_next_node_random(conn, agent, current_node, edges):
+def compute_route(conn, agent):
     """
-    Fallback: weighted-random edge selection based on turn angle.
+    Compute (or re-compute) the shortest path from current_node to target_node
+    using pgRouting Dijkstra. Caches the result.
     """
-    prev_node = agent_prev_node.get(agent["agent_id"])
-    weighted = weight_edges_with_history(conn, prev_node, current_node, edges)
-
-    total = sum(w for _, w in weighted)
-    if total == 0:
-        edge = random.choice(edges)
-    else:
-        r = random.uniform(0, total)
-        cumulative = 0
-        edge = weighted[0][0]
-        for e, w in weighted:
-            cumulative += w
-            if r <= cumulative:
-                edge = e
-                break
-
-    return edge["target_node"], edge
+    path = get_shortest_path(conn, agent["current_node"], agent["target_node"])
+    if path:
+        route_nodes = [step["node_id"] for step in path if step["node_id"] != -1]
+        agent_planned_route[agent["agent_id"]] = route_nodes
+        return route_nodes
+    return []
 
 
-def pick_next_node_llm(conn, agent, current_node, edges):
+def score_edge_spatially(edge, current_dist_to_target):
     """
-    Use LLM to decide which edge the vehicle should take.
-    Presents road options and asks the model to choose.
+    Score an enriched edge based on spatial properties.
+    Higher score = better choice.
     """
-    prev_node = agent_prev_node.get(agent["agent_id"])
+    score = 0.0
 
-    # Build option descriptions
+    # 1. Reward edges that bring us closer to target
+    dist_to_target = edge.get("dist_to_target_m")
+    if dist_to_target is not None and current_dist_to_target:
+        progress = current_dist_to_target - dist_to_target  # positive = getting closer
+        score += max(0, progress) * 0.01  # scale factor
+
+    # 2. Penalize congested edges heavily
+    congestion = edge.get("congestion", 0)
+    score -= congestion * 2.0
+
+    # 3. Prefer faster roads
+    speed = edge.get("speed_kph") or 30
+    score += speed * 0.05
+
+    # 4. Slight preference for shorter segments (more responsive navigation)
+    length = edge.get("length_m") or 100
+    if length < 200:
+        score += 0.5
+
+    return score
+
+
+def pick_next_node_spatial(conn, agent, current_node, enriched_edges, current_dist):
+    """
+    Spatially-intelligent edge selection using PostGIS-computed metrics.
+    Considers: distance-to-target progress, congestion, speed, route plan.
+    """
+    # Check if we have a planned route and the next step is among our options
+    route = agent_planned_route.get(agent["agent_id"], [])
+    if route:
+        # Find the next node in our planned route
+        try:
+            current_idx = route.index(current_node)
+            if current_idx + 1 < len(route):
+                next_planned = route[current_idx + 1]
+                for e in enriched_edges:
+                    if e["target_node_"] == next_planned:
+                        return next_planned, e
+        except ValueError:
+            pass  # current_node not in route (stale), recompute later
+
+    # Score all candidate edges
+    scored = []
+    for e in enriched_edges:
+        s = score_edge_spatially(e, current_dist)
+        scored.append((e, s))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    if scored:
+        edge = scored[0][0]
+        return edge["target_node_"], edge
+
+    return None, None
+
+
+def pick_next_node_llm(conn, agent, current_node, enriched_edges, current_dist):
+    """
+    LLM-powered navigation with FULL spatial context from PostGIS.
+    The LLM sees: distance to target, congestion, bearings, route progress.
+    """
+    # Build rich spatial context for each option
     options = []
-    for i, e in enumerate(edges):
+    for i, e in enumerate(enriched_edges):
         street = e.get("name") or e.get("highway") or "unnamed road"
-        length = e.get("length_m", 0)
-        speed = e.get("speed_kph", "unknown")
-        options.append(f"  {i}: \"{street}\" ({length:.0f}m, speed limit {speed} km/h)")
+        length = e.get("length_m", 0) or 0
+        speed = e.get("speed_kph") or "unknown"
+        dist_to_target = e.get("dist_to_target_m")
+        congestion = e.get("congestion", 0)
+        bearing = e.get("edge_bearing")
+
+        parts = [f'{i}: "{street}" ({length:.0f}m, {speed} km/h)']
+        if dist_to_target is not None:
+            progress = (current_dist - dist_to_target) if current_dist else 0
+            parts.append(f"    -> brings you {progress:.0f}m closer to destination" if progress > 0
+                        else f"    -> takes you {abs(progress):.0f}m further from destination")
+        if congestion > 0:
+            parts.append(f"    -> CONGESTION: {congestion} vehicles ahead")
+        if bearing is not None:
+            parts.append(f"    -> heading {bearing:.0f}°")
+
+        options.append("\n".join(parts))
 
     options_text = "\n".join(options)
 
+    # Get nearby vehicles for situational awareness
+    nearby = get_nearby_agents(conn, current_node, 200.0)
+    nearby_self = [a for a in nearby if a["agent_id"] != agent["agent_id"]]
+    nearby_text = ""
+    if nearby_self:
+        nearby_text = f"\nNearby vehicles ({len(nearby_self)} within 200m):"
+        for n in nearby_self[:3]:
+            nearby_text += f"\n  - {n['name']} ({n['distance_m']:.0f}m away, {n['status']})"
+
     system_prompt = (
-        "You are a vehicle navigation AI. Pick which road to take next. "
+        "You are a vehicle navigation AI optimizing for: "
+        "1) reaching the destination quickly, "
+        "2) avoiding congested roads, "
+        "3) preferring faster roads. "
         "Reply with ONLY the option number (e.g. 0, 1, 2). No explanation."
     )
 
-    context_parts = [f"Vehicle: {agent['name']}, speed: {agent['speed_kmh']} km/h"]
-    if prev_node:
-        context_parts.append(f"Came from node {prev_node}")
-    context_parts.append(f"Currently at node {current_node}")
-    context_parts.append(f"Target destination: node {agent['target_node']}")
-    context_parts.append(f"\nAvailable roads:\n{options_text}")
-    context_parts.append(f"\nWhich road? Reply with the number only.")
+    bearing_to_target = get_bearing_to_target(conn, current_node, agent["target_node"])
+    bearing_text = f"\nBearing to destination: {bearing_to_target:.0f}°" if bearing_to_target else ""
 
-    human_prompt = "\n".join(context_parts)
+    context_parts = [
+        f"Vehicle: {agent['name']}, speed: {agent['speed_kmh']} km/h",
+        f"Distance to destination: {current_dist:.0f}m" if current_dist else "",
+        bearing_text,
+        nearby_text,
+        f"\nAvailable roads:\n{options_text}",
+        f"\nWhich road? Reply with the number only.",
+    ]
+
+    human_prompt = "\n".join(p for p in context_parts if p)
 
     try:
         choice_text = llm_chat(system_prompt, human_prompt)
-        # Strip any <think>...</think> tags qwen3 might emit
         choice_text = re.sub(r"<think>.*?</think>", "", choice_text, flags=re.DOTALL).strip()
-        # Extract first number from response
         digits = re.search(r"\d+", choice_text)
         if digits:
             choice = int(digits.group())
-            if 0 <= choice < len(edges):
-                edge = edges[choice]
-                return edge["target_node"], edge
+            if 0 <= choice < len(enriched_edges):
+                edge = enriched_edges[choice]
+                return edge["target_node_"], edge
     except Exception as e:
         print(f"    [LLM fallback] {e}")
 
-    # Fallback to weighted random
-    return pick_next_node_random(conn, agent, current_node, edges)
+    # Fallback to spatial scoring
+    return pick_next_node_spatial(conn, agent, current_node, enriched_edges, current_dist)
 
 
 def pick_next_node(conn, agent, current_node):
     """
-    Pick the next node for a vehicle to move to.
-    Uses LLM decision-making when enabled, otherwise weighted-random.
-    Returns (next_node, edge_info) or (None, None) if stuck.
+    Pick the next node using PostGIS spatial intelligence.
+    1. Get enriched edges (distance, bearing, congestion) from PostGIS
+    2. Check if re-routing is needed (congestion ahead)
+    3. Use LLM with full spatial context, or spatial scoring as fallback
     """
-    edges = get_outgoing_edges(conn, current_node)
-    if not edges:
+    # Get spatially-enriched edges from PostGIS
+    enriched = get_enriched_edges(conn, current_node, agent["target_node"])
+
+    if not enriched:
+        # Try reverse edges for bidirectional roads
         edges = get_incoming_edges(conn, current_node)
-    if not edges:
+        if not edges:
+            return None, None
+        # Fall back to basic edges without enrichment
+        enriched = []
+        for e in edges:
+            enriched.append({
+                "edge_id": e["edge_id"],
+                "source_node": e["source_node"],
+                "target_node_": e["target_node"],
+                "name": e["name"],
+                "highway": e["highway"],
+                "length_m": e["length_m"],
+                "speed_kph": e["speed_kph"],
+                "dist_to_target_m": None,
+                "bearing_to_target": None,
+                "edge_bearing": None,
+                "congestion": 0,
+            })
+
+    if not enriched:
         return None, None
 
+    # Current straight-line distance to target
+    current_dist = get_distance_to_target(conn, current_node, agent["target_node"])
+
     if USE_LLM:
-        return pick_next_node_llm(conn, agent, current_node, edges)
+        return pick_next_node_llm(conn, agent, current_node, enriched, current_dist)
     else:
-        return pick_next_node_random(conn, agent, current_node, edges)
+        return pick_next_node_spatial(conn, agent, current_node, enriched, current_dist)
 
 
 def plan_move(conn, agent):
@@ -437,21 +538,68 @@ def resolve_give_way(conn, moves):
     return blocked
 
 
-def step_agents(conn, agents):
+INITIAL_VEHICLES = [(f"car_{i:02d}", random.uniform(30.0, 60.0)) for i in range(1, 11)]
+
+
+def seed_vehicles(conn):
     """
-    Advance all vehicles by one tick with give-way-to-left conflict resolution.
+    Insert initial vehicles with spatially-separated start/target nodes.
+    Uses ST_Distance to ensure start and target are meaningfully apart.
     """
-    # Phase 1: Plan moves for all agents
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM agents WHERE agent_type = 'vehicle'")
+        count = cur.fetchone()[0]
+        if count > 0:
+            return  # already seeded
+
+        for name, speed in INITIAL_VEHICLES:
+            # Pick start and target that are at least 500m apart
+            cur.execute("""
+                WITH start_node AS (
+                    SELECT node_id, geom FROM nodes ORDER BY random() LIMIT 1
+                )
+                INSERT INTO agents (name, agent_type, current_node, target_node, speed_kmh, geom)
+                SELECT %s, 'vehicle', s.node_id,
+                       (SELECT n.node_id FROM nodes n, start_node s2
+                        WHERE ST_Distance(n.geom::geography, s2.geom::geography) > 500
+                        ORDER BY random() LIMIT 1),
+                       %s, s.geom
+                FROM start_node s, start_node s2
+            """, (name, speed))
+    conn.commit()
+    print(f"Seeded {len(INITIAL_VEHICLES)} vehicles (min 500m apart from targets).\n")
+
+
+def step_agents(conn, agents, tick):
+    """
+    Advance all vehicles by one tick with spatial intelligence and conflict resolution.
+    Uses ThreadPoolExecutor to parallelize LLM calls across vehicles.
+    """
+    # Phase 1: Plan moves for all agents (parallelized)
+    active_agents = [a for a in agents if a["status"] != "arrived"]
+    arrived_agents = [a for a in agents if a["status"] == "arrived"]
+
+    for agent in arrived_agents:
+        print(f"  [{agent['name']}] Already arrived at destination")
+
+    def plan_for_agent(agent):
+        """Plan move for a single agent using its own DB connection."""
+        thread_conn = get_connection()
+        try:
+            next_node, edge = plan_move(thread_conn, agent)
+            return agent, next_node, edge
+        finally:
+            thread_conn.close()
+
     planned_moves = {}
-    for agent in agents:
-        if agent["status"] == "arrived":
-            print(f"  [{agent['name']}] Already arrived at destination")
-            continue
-        next_node, edge = plan_move(conn, agent)
-        if next_node is None:
-            print(f"  [{agent['name']}] STUCK at node {agent['current_node']} -- no outgoing edges")
-            continue
-        planned_moves[agent["agent_id"]] = (agent, next_node, edge)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(plan_for_agent, a): a for a in active_agents}
+        for future in as_completed(futures):
+            agent, next_node, edge = future.result()
+            if next_node is None:
+                print(f"  [{agent['name']}] STUCK at node {agent['current_node']} -- no outgoing edges")
+            else:
+                planned_moves[agent["agent_id"]] = (agent, next_node, edge)
 
     # Phase 2: Resolve give-way conflicts
     blocked = resolve_give_way(conn, planned_moves)
@@ -473,18 +621,28 @@ def step_agents(conn, agents):
             status = "arrived"
 
         update_agent_position(conn, agent_id, next_node, status)
+        record_trail(conn, agent_id, tick, next_node)
 
         street = edge.get("name") or edge.get("highway") or "unnamed road"
-        length = edge.get("length_m", 0)
-        print(f"  [{name}] {current} -> {next_node} via \"{street}\" ({length:.0f}m) [{status}]")
+        length = edge.get("length_m") or 0
+        congestion = edge.get("congestion", 0)
+        dist_remaining = edge.get("dist_to_target_m")
+
+        extra = ""
+        if congestion > 0:
+            extra += f" [!{congestion} vehicles]"
+        if dist_remaining:
+            extra += f" [{dist_remaining:.0f}m to go]"
+
+        print(f"  [{name}] {current} -> {next_node} via \"{street}\" ({length:.0f}m){extra} [{status}]")
 
 
 def run_simulation():
-    """Main orchestrator loop."""
+    """Main orchestrator loop with spatial intelligence."""
     conn = get_connection()
 
     print("=" * 60)
-    print("  TRAFFIC SIMULATION ORCHESTRATOR")
+    print("  TRAFFIC SIMULATION ORCHESTRATOR (PostGIS Spatial AI)")
     print("=" * 60)
     print()
 
@@ -493,7 +651,16 @@ def run_simulation():
     agents = load_agents(conn)
     print(f"Loaded {len(agents)} vehicles:\n")
     for a in agents:
-        print(f"  - {a['name']} at node {a['current_node']} -> target {a['target_node']}")
+        dist = get_distance_to_target(conn, a["current_node"], a["target_node"])
+        dist_str = f"{dist:.0f}m" if dist else "?"
+        print(f"  - {a['name']} at node {a['current_node']} -> target {a['target_node']} ({dist_str} away)")
+
+    # Compute initial shortest-path routes for all vehicles
+    print("\nComputing shortest-path routes (pgRouting Dijkstra)...")
+    for a in agents:
+        route = compute_route(conn, a)
+        hops = len(route) if route else 0
+        print(f"  - {a['name']}: {hops} hops planned")
     print()
 
     for tick in range(1, MAX_TICKS + 1):
@@ -502,7 +669,7 @@ def run_simulation():
         # Reload agents to get updated positions
         agents = load_agents(conn)
 
-        step_agents(conn, agents)
+        step_agents(conn, agents, tick)
 
         print()
         time.sleep(TICK_INTERVAL)
@@ -513,8 +680,10 @@ def run_simulation():
     print("=" * 60)
     agents = load_agents(conn)
     for a in agents:
+        dist = get_distance_to_target(conn, a["current_node"], a["target_node"])
+        dist_str = f" ({dist:.0f}m remaining)" if dist and a["status"] != "arrived" else ""
         marker = "[OK]" if a["status"] == "arrived" else "[..]"
-        print(f"  {marker} {a['name']}: node {a['current_node']} [{a['status']}]")
+        print(f"  {marker} {a['name']}: node {a['current_node']} [{a['status']}]{dist_str}")
 
     conn.close()
 
