@@ -1,25 +1,22 @@
 """
-Traffic Simulation Orchestrator
+Traffic Simulation Orchestrator — Autonomous Vehicle Agents
 
-A loop that moves vehicles step-by-step over the road network.
-Each tick, every vehicle uses PostGIS spatial intelligence to navigate:
-  - pgRouting Dijkstra shortest-path to compute optimal routes
-  - ST_Distance / ST_DWithin for congestion detection and avoidance
-  - Enriched edge queries with distance-to-target, bearing, and congestion
-  - LLM receives full spatial context (not just street names)
-  - pgRouting Dijkstra for optimal route planning
+Each vehicle is a fully autonomous LLM agent with direct database access.
+Per tick, the agent runs a ReAct tool-calling loop via Ollama:
+  - It can query PostGIS/pgRouting however it likes (read-only SQL)
+  - It decides when it has enough information
+  - It commits a move by calling move_to(node_id)
+
+The orchestrator is a thin tick-clock + conflict resolver.
 
 Usage:
     python3 scripts/orchestrator.py
 """
 
 import json
-import math
 import random
-import re
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import psycopg2
 import requests
@@ -35,30 +32,104 @@ DB_CONFIG = {
     "password": "traffic123",
 }
 
-TICK_INTERVAL = 1.0  # seconds between simulation steps
-MAX_TICKS = 20       # run for this many steps then stop
+TICK_INTERVAL = 0.5   # seconds between simulation steps
+MAX_TICKS = 20        # run for this many steps then stop
+MAX_TOOL_CALLS = 6    # cap tool calls per agent per tick
+OLLAMA_TIMEOUT = 120  # seconds — Ollama queues requests serially
 
 OLLAMA_MODEL = "qwen3:8b"
 OLLAMA_URL = "http://localhost:11434/api/chat"
-USE_LLM = True  # set False to fall back to spatial-weighted only
 
+# ─── Tool definitions (Ollama function-calling schema) ───────────────────────
 
-# ─── LLM helper ──────────────────────────────────────────────────────────────
-
-def llm_chat(system_prompt, user_prompt):
-    """Call Ollama chat API directly (bypasses langchain think-mode bug)."""
-    resp = requests.post(OLLAMA_URL, json={
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "think": False,
-        "options": {"temperature": 0.4, "num_predict": 8},
-    }, timeout=10)
-    resp.raise_for_status()
-    return resp.json()["message"]["content"].strip()
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_roads_from_here",
+            "description": "Get all roads leaving from your current intersection. Returns road name, length in meters, speed limit, and the node_id at the other end.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_congestion",
+            "description": "Check how many vehicles are currently on or near a specific road (edge_id). Returns a count.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "edge_id": {"type": "integer", "description": "The edge_id of the road to check."},
+                },
+                "required": ["edge_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_nearby_vehicles",
+            "description": "Get vehicles near your current position within a radius. Returns their names, distances, and statuses.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "radius_m": {"type": "number", "description": "Search radius in meters (default 200)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_distance_to_destination",
+            "description": "Get the straight-line distance in meters from a given node to your destination.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_node": {"type": "integer", "description": "Node to measure from. Omit to use your current node."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compute_shortest_route",
+            "description": "Compute the shortest path (Dijkstra) from your current node to your destination. Returns a list of node_ids and total distance in meters.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_db",
+            "description": "Execute a read-only SQL query against the traffic database. Tables: nodes(node_id, geom), edges(edge_id, source_node, target_node, name, highway, length_m, speed_kph, oneway, geom), agents(agent_id, name, current_node, target_node, speed_kmh, status, geom). PostGIS and pgRouting functions available. MAX 5 rows returned.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "A SELECT query to run."},
+                },
+                "required": ["sql"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_to",
+            "description": "Move your vehicle to an adjacent node. This ends your turn. The node MUST be directly connected to your current node by a road.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_id": {"type": "integer", "description": "The node_id to move to (must be adjacent)."},
+                },
+                "required": ["node_id"],
+            },
+        },
+    },
+]
 
 
 # ─── Database helpers ────────────────────────────────────────────────────────
@@ -68,143 +139,15 @@ def get_connection():
 
 
 def load_agents(conn):
-    """Load all vehicle agents from the database."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT agent_id, name, current_node, target_node, speed_kmh, status
-            FROM agents
-            WHERE agent_type = 'vehicle'
+            FROM agents WHERE agent_type = 'vehicle'
         """)
         return cur.fetchall()
 
 
-def get_outgoing_edges(conn, node_id):
-    """Get all edges leaving from a given node."""
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT edge_id, source_node, target_node, name, highway, length_m, speed_kph
-            FROM edges
-            WHERE source_node = %s
-        """, (node_id,))
-        return cur.fetchall()
-
-
-def get_incoming_edges(conn, node_id):
-    """Get edges arriving at a node (for bidirectional roads)."""
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT edge_id, source_node, target_node AS target_node, name, highway, length_m, speed_kph
-            FROM edges
-            WHERE target_node = %s AND oneway = FALSE
-        """, (node_id,))
-        return cur.fetchall()
-
-
-def get_node_coords(conn, node_id):
-    """Get (lon, lat) for a node from its PostGIS geometry."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT ST_X(geom), ST_Y(geom) FROM nodes WHERE node_id = %s
-        """, (node_id,))
-        row = cur.fetchone()
-        if row:
-            return row[0], row[1]
-        return None, None
-
-
-# ─── PostGIS Spatial Intelligence ────────────────────────────────────────────
-
-def get_enriched_edges(conn, from_node, target_node):
-    """
-    Get outgoing edges enriched with PostGIS spatial data:
-    - distance from each candidate's endpoint to the agent's target
-    - bearing toward target
-    - edge bearing (direction of travel)
-    - congestion count (vehicles currently on/near the edge)
-    """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT * FROM enriched_outgoing_edges(%s, %s)
-        """, (from_node, target_node))
-        return cur.fetchall()
-
-
-def get_shortest_path(conn, from_node, target_node):
-    """
-    Use pgRouting Dijkstra to compute the shortest path.
-    Returns list of (edge_id, node_id, cost) or empty list if no path.
-    """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        try:
-            cur.execute("""
-                SELECT seq, edge_id, node_id, cost
-                FROM shortest_path_edges(%s, %s)
-            """, (from_node, target_node))
-            return cur.fetchall()
-        except Exception:
-            conn.rollback()
-            return []
-
-
-def get_shortest_path_cost(conn, from_node, target_node):
-    """Get total shortest-path distance in meters via pgRouting."""
-    with conn.cursor() as cur:
-        try:
-            cur.execute("SELECT shortest_path_cost(%s, %s)", (from_node, target_node))
-            result = cur.fetchone()
-            return result[0] if result and result[0] else None
-        except Exception:
-            conn.rollback()
-            return None
-
-
-def get_congestion_at_node(conn, node_id, radius_m=100.0):
-    """Count vehicles near a node using ST_DWithin (geography)."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT agents_near_node(%s, %s)", (node_id, radius_m))
-        return cur.fetchone()[0]
-
-
-def get_congestion_on_edge(conn, edge_id):
-    """Count vehicles on/near a specific edge using ST_DWithin."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT agents_on_edge(%s)", (edge_id,))
-        return cur.fetchone()[0]
-
-
-def get_nearby_agents(conn, node_id, radius_m=200.0):
-    """Get details of nearby agents within radius (for situational awareness)."""
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT a.agent_id, a.name, a.current_node, a.status, a.speed_kmh,
-                   ST_Distance(a.geom::geography, n.geom::geography) AS distance_m
-            FROM agents a, nodes n
-            WHERE n.node_id = %s
-              AND a.geom IS NOT NULL
-              AND ST_DWithin(a.geom::geography, n.geom::geography, %s)
-            ORDER BY distance_m
-        """, (node_id, radius_m))
-        return cur.fetchall()
-
-
-def get_distance_to_target(conn, from_node, target_node):
-    """Straight-line distance (meters) between two nodes using PostGIS geography."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT node_distance_m(%s, %s)", (from_node, target_node))
-        result = cur.fetchone()
-        return result[0] if result else None
-
-
-def get_bearing_to_target(conn, from_node, target_node):
-    """Bearing (degrees from north) from from_node to target_node."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT node_bearing(%s, %s)", (from_node, target_node))
-        result = cur.fetchone()
-        return result[0] if result else None
-
-
 def record_trail(conn, agent_id, tick, node_id):
-    """Record agent position in the trail table for later analytics."""
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO agent_trails (agent_id, tick, node_id, geom)
@@ -214,12 +157,10 @@ def record_trail(conn, agent_id, tick, node_id):
 
 
 def update_agent_position(conn, agent_id, new_node, status="moving"):
-    """Update an agent's current node and geom in the database."""
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE agents
-            SET current_node = %s,
-                status = %s,
+            SET current_node = %s, status = %s,
                 geom = (SELECT geom FROM nodes WHERE node_id = %s),
                 updated_at = now()
             WHERE agent_id = %s
@@ -227,333 +168,243 @@ def update_agent_position(conn, agent_id, new_node, status="moving"):
     conn.commit()
 
 
-# ─── Simulation logic ────────────────────────────────────────────────────────
+# ─── Tool execution ──────────────────────────────────────────────────────────
 
-# ─── Geometry / bearing helpers ──────────────────────────────────────────────
-
-def compute_bearing(lon1, lat1, lon2, lat2):
+def execute_tool(conn, agent, tool_name, args):
     """
-    Compute initial bearing (0-360°, clockwise from north) from point 1 to point 2.
+    Execute a tool call on behalf of a vehicle agent.
+    Returns (result_string, is_move, move_node_id).
     """
-    lat1_r, lat2_r = math.radians(lat1), math.radians(lat2)
-    dlon = math.radians(lon2 - lon1)
-    x = math.sin(dlon) * math.cos(lat2_r)
-    y = math.cos(lat1_r) * math.sin(lat2_r) - \
-        math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
-    bearing = math.degrees(math.atan2(x, y))
-    return bearing % 360
+    current_node = agent["current_node"]
+    target_node = agent["target_node"]
+
+    if tool_name == "get_roads_from_here":
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT edge_id, target_node, name, highway, length_m, speed_kph
+                FROM edges WHERE source_node = %s
+                UNION ALL
+                SELECT edge_id, source_node AS target_node, name, highway, length_m, speed_kph
+                FROM edges WHERE target_node = %s AND oneway = FALSE
+            """, (current_node, current_node))
+            rows = cur.fetchall()
+        if not rows:
+            return "No roads leaving your current intersection.", False, None
+        lines = []
+        for r in rows:
+            name = r["name"] or r["highway"] or "unnamed"
+            lines.append(f"- edge_id={r['edge_id']}, to node {r['target_node']}, "
+                        f"\"{name}\", {r['length_m']:.0f}m, {r['speed_kph']} km/h")
+        return "\n".join(lines), False, None
+
+    elif tool_name == "check_congestion":
+        edge_id = args.get("edge_id")
+        if edge_id is None:
+            return "Error: edge_id required.", False, None
+        with conn.cursor() as cur:
+            cur.execute("SELECT agents_on_edge(%s)", (int(edge_id),))
+            count = cur.fetchone()[0]
+        return f"{count} vehicle(s) on/near edge {edge_id}.", False, None
+
+    elif tool_name == "get_nearby_vehicles":
+        radius = args.get("radius_m", 200)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT a.name, a.status, a.speed_kmh,
+                       ST_Distance(a.geom::geography, n.geom::geography)::int AS distance_m
+                FROM agents a, nodes n
+                WHERE n.node_id = %s AND a.geom IS NOT NULL
+                  AND a.agent_id != %s
+                  AND ST_DWithin(a.geom::geography, n.geom::geography, %s)
+                ORDER BY distance_m LIMIT 5
+            """, (current_node, agent["agent_id"], float(radius)))
+            rows = cur.fetchall()
+        if not rows:
+            return "No other vehicles nearby.", False, None
+        lines = [f"- {r['name']}: {r['distance_m']}m away, {r['status']}, {r['speed_kmh']} km/h"
+                 for r in rows]
+        return "\n".join(lines), False, None
+
+    elif tool_name == "get_distance_to_destination":
+        from_node = args.get("from_node", current_node)
+        with conn.cursor() as cur:
+            cur.execute("SELECT node_distance_m(%s, %s)", (int(from_node), target_node))
+            dist = cur.fetchone()[0]
+        if dist is None:
+            return "Could not compute distance.", False, None
+        return f"{dist:.0f} meters from node {from_node} to your destination.", False, None
+
+    elif tool_name == "compute_shortest_route":
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute("""
+                    SELECT node AS node_id, cost FROM pgr_dijkstra(
+                        'SELECT edge_id AS id, source_node AS source, target_node AS target,
+                         length_m AS cost, CASE WHEN oneway THEN -1 ELSE length_m END AS reverse_cost
+                         FROM edges',
+                        %s, %s, directed := true
+                    ) ORDER BY seq
+                """, (current_node, target_node))
+                rows = cur.fetchall()
+            except Exception:
+                conn.rollback()
+                return "No route found to destination.", False, None
+        if not rows:
+            return "No route found to destination.", False, None
+        node_ids = [r["node_id"] for r in rows if r["node_id"] != -1]
+        total_cost = sum(r["cost"] for r in rows if r["cost"] > 0)
+        return (f"Shortest route ({total_cost:.0f}m, {len(node_ids)} hops): "
+                f"{' -> '.join(str(n) for n in node_ids[:10])}"
+                f"{'...' if len(node_ids) > 10 else ''}"), False, None
+
+    elif tool_name == "query_db":
+        sql = args.get("sql", "").strip()
+        if not sql:
+            return "Error: sql parameter required.", False, None
+        # Security: only allow SELECT/WITH
+        sql_upper = sql.upper().lstrip()
+        if not (sql_upper.startswith("SELECT") or sql_upper.startswith("WITH")):
+            return "Error: only SELECT queries allowed.", False, None
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(sql + " LIMIT 5" if "LIMIT" not in sql.upper() else sql)
+                rows = cur.fetchall()
+            except Exception as e:
+                conn.rollback()
+                return f"SQL error: {e}", False, None
+        if not rows:
+            return "Query returned no results.", False, None
+        return json.dumps([dict(r) for r in rows], default=str), False, None
+
+    elif tool_name == "move_to":
+        node_id = args.get("node_id")
+        if node_id is None:
+            return "Error: node_id required.", False, None
+        node_id = int(node_id)
+        # Validate adjacency
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM edges
+                WHERE (source_node = %s AND target_node = %s)
+                   OR (target_node = %s AND source_node = %s AND oneway = FALSE)
+                LIMIT 1
+            """, (current_node, node_id, current_node, node_id))
+            if not cur.fetchone():
+                return (f"Error: node {node_id} is not adjacent to your current node "
+                        f"{current_node}. Use get_roads_from_here to see valid moves."), False, None
+        return f"Moving to node {node_id}.", True, node_id
+
+    return f"Unknown tool: {tool_name}", False, None
 
 
-def angle_difference(bearing1, bearing2):
-    """
-    Signed angle from bearing1 to bearing2 (-180 to +180).
-    Positive = bearing2 is clockwise (to the right) of bearing1.
-    """
-    diff = (bearing2 - bearing1 + 180) % 360 - 180
-    return diff
+# ─── Vehicle Agent (LLM tool-calling loop) ───────────────────────────────────
 
-
-def is_approaching_from_left(my_approach_bearing, other_approach_bearing):
-    """
-    Determine if another vehicle is approaching the intersection from my left.
-    """
-    other_from = (other_approach_bearing + 180) % 360
-    diff = angle_difference(my_approach_bearing, other_from)
-    return -150 <= diff <= -30
-
-
-# ─── Spatial route planning ──────────────────────────────────────────────────
-
-# Maps agent_id -> previous_node (to compute approach bearing)
-agent_prev_node = {}
-
-# Maps agent_id -> cached shortest path (list of node_ids)
-agent_planned_route = {}
-
-
-def compute_route(conn, agent):
-    """
-    Compute (or re-compute) the shortest path from current_node to target_node
-    using pgRouting Dijkstra. Caches the result.
-    """
-    path = get_shortest_path(conn, agent["current_node"], agent["target_node"])
-    if path:
-        route_nodes = [step["node_id"] for step in path if step["node_id"] != -1]
-        agent_planned_route[agent["agent_id"]] = route_nodes
-        return route_nodes
-    return []
-
-
-def score_edge_spatially(edge, current_dist_to_target):
-    """
-    Score an enriched edge based on spatial properties.
-    Higher score = better choice.
-    """
-    score = 0.0
-
-    # 1. Reward edges that bring us closer to target
-    dist_to_target = edge.get("dist_to_target_m")
-    if dist_to_target is not None and current_dist_to_target:
-        progress = current_dist_to_target - dist_to_target  # positive = getting closer
-        score += max(0, progress) * 0.01  # scale factor
-
-    # 2. Penalize congested edges heavily
-    congestion = edge.get("congestion", 0)
-    score -= congestion * 2.0
-
-    # 3. Prefer faster roads
-    speed = edge.get("speed_kph") or 30
-    score += speed * 0.05
-
-    # 4. Slight preference for shorter segments (more responsive navigation)
-    length = edge.get("length_m") or 100
-    if length < 200:
-        score += 0.5
-
-    return score
-
-
-def pick_next_node_spatial(conn, agent, current_node, enriched_edges, current_dist):
-    """
-    Spatially-intelligent edge selection using PostGIS-computed metrics.
-    Considers: distance-to-target progress, congestion, speed, route plan.
-    """
-    # Check if we have a planned route and the next step is among our options
-    route = agent_planned_route.get(agent["agent_id"], [])
-    if route:
-        # Find the next node in our planned route
-        try:
-            current_idx = route.index(current_node)
-            if current_idx + 1 < len(route):
-                next_planned = route[current_idx + 1]
-                for e in enriched_edges:
-                    if e["target_node_"] == next_planned:
-                        return next_planned, e
-        except ValueError:
-            pass  # current_node not in route (stale), recompute later
-
-    # Score all candidate edges
-    scored = []
-    for e in enriched_edges:
-        s = score_edge_spatially(e, current_dist)
-        scored.append((e, s))
-
-    scored.sort(key=lambda x: x[1], reverse=True)
-
-    if scored:
-        edge = scored[0][0]
-        return edge["target_node_"], edge
-
-    return None, None
-
-
-def pick_next_node_llm(conn, agent, current_node, enriched_edges, current_dist):
-    """
-    LLM-powered navigation with FULL spatial context from PostGIS.
-    The LLM sees: distance to target, congestion, bearings, route progress.
-    """
-    # Build rich spatial context for each option
-    options = []
-    for i, e in enumerate(enriched_edges):
-        street = e.get("name") or e.get("highway") or "unnamed road"
-        length = e.get("length_m", 0) or 0
-        speed = e.get("speed_kph") or "unknown"
-        dist_to_target = e.get("dist_to_target_m")
-        congestion = e.get("congestion", 0)
-        bearing = e.get("edge_bearing")
-
-        parts = [f'{i}: "{street}" ({length:.0f}m, {speed} km/h)']
-        if dist_to_target is not None:
-            progress = (current_dist - dist_to_target) if current_dist else 0
-            parts.append(f"    -> brings you {progress:.0f}m closer to destination" if progress > 0
-                        else f"    -> takes you {abs(progress):.0f}m further from destination")
-        if congestion > 0:
-            parts.append(f"    -> CONGESTION: {congestion} vehicles ahead")
-        if bearing is not None:
-            parts.append(f"    -> heading {bearing:.0f}°")
-
-        options.append("\n".join(parts))
-
-    options_text = "\n".join(options)
-
-    # Get nearby vehicles for situational awareness
-    nearby = get_nearby_agents(conn, current_node, 200.0)
-    nearby_self = [a for a in nearby if a["agent_id"] != agent["agent_id"]]
-    nearby_text = ""
-    if nearby_self:
-        nearby_text = f"\nNearby vehicles ({len(nearby_self)} within 200m):"
-        for n in nearby_self[:3]:
-            nearby_text += f"\n  - {n['name']} ({n['distance_m']:.0f}m away, {n['status']})"
-
-    system_prompt = (
-        "You are a vehicle navigation AI optimizing for: "
-        "1) reaching the destination quickly, "
-        "2) avoiding congested roads, "
-        "3) preferring faster roads. "
-        "Reply with ONLY the option number (e.g. 0, 1, 2). No explanation."
+def build_system_prompt(agent):
+    """Build the system prompt that gives the vehicle its identity and goals."""
+    return (
+        f"You are {agent['name']}, an autonomous vehicle navigating Wellington CBD.\n"
+        f"Your current position: node {agent['current_node']}\n"
+        f"Your destination: node {agent['target_node']}\n"
+        f"Your speed: {agent['speed_kmh']} km/h\n\n"
+        "You have tools to query the road network database (PostGIS + pgRouting).\n"
+        "Use them to understand your surroundings, check for congestion, and plan your route.\n"
+        "When you've decided, call move_to(node_id) to move to an adjacent intersection.\n\n"
+        "Strategy: reach your destination efficiently while avoiding congested roads.\n"
+        "You MUST call move_to exactly once to end your turn. Be decisive — don't over-analyze."
     )
 
-    bearing_to_target = get_bearing_to_target(conn, current_node, agent["target_node"])
-    bearing_text = f"\nBearing to destination: {bearing_to_target:.0f}°" if bearing_to_target else ""
 
-    context_parts = [
-        f"Vehicle: {agent['name']}, speed: {agent['speed_kmh']} km/h",
-        f"Distance to destination: {current_dist:.0f}m" if current_dist else "",
-        bearing_text,
-        nearby_text,
-        f"\nAvailable roads:\n{options_text}",
-        f"\nWhich road? Reply with the number only.",
-    ]
-
-    human_prompt = "\n".join(p for p in context_parts if p)
+def run_vehicle_agent(agent, tick):
+    """
+    Run one tick of an autonomous vehicle agent.
+    Returns (chosen_node_id, reasoning_log) or (None, error_msg).
+    """
+    conn = get_connection()
+    reasoning_log = []
+    move_node = None
 
     try:
-        choice_text = llm_chat(system_prompt, human_prompt)
-        choice_text = re.sub(r"<think>.*?</think>", "", choice_text, flags=re.DOTALL).strip()
-        digits = re.search(r"\d+", choice_text)
-        if digits:
-            choice = int(digits.group())
-            if 0 <= choice < len(enriched_edges):
-                edge = enriched_edges[choice]
-                return edge["target_node_"], edge
-    except Exception as e:
-        print(f"    [LLM fallback] {e}")
+        messages = [
+            {"role": "system", "content": build_system_prompt(agent)},
+            {"role": "user", "content": f"Tick {tick}. Decide your next move."},
+        ]
 
-    # Fallback to spatial scoring
-    return pick_next_node_spatial(conn, agent, current_node, enriched_edges, current_dist)
+        for step in range(MAX_TOOL_CALLS):
+            # Call Ollama with tools
+            resp = requests.post(OLLAMA_URL, json={
+                "model": OLLAMA_MODEL,
+                "messages": messages,
+                "tools": TOOLS,
+                "stream": False,
+                "think": False,
+                "options": {"temperature": 0.3, "num_predict": 256},
+            }, timeout=OLLAMA_TIMEOUT)
+            resp.raise_for_status()
+            result = resp.json()
 
+            msg = result["message"]
+            messages.append(msg)
 
-def pick_next_node(conn, agent, current_node):
-    """
-    Pick the next node using PostGIS spatial intelligence.
-    1. Get enriched edges (distance, bearing, congestion) from PostGIS
-    2. Check if re-routing is needed (congestion ahead)
-    3. Use LLM with full spatial context, or spatial scoring as fallback
-    """
-    # Get spatially-enriched edges from PostGIS
-    enriched = get_enriched_edges(conn, current_node, agent["target_node"])
+            # If no tool calls, the LLM is done (maybe gave a text response)
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                reasoning_log.append(f"[text] {msg.get('content', '')[:100]}")
+                break
 
-    if not enriched:
-        # Try reverse edges for bidirectional roads
-        edges = get_incoming_edges(conn, current_node)
-        if not edges:
-            return None, None
-        # Fall back to basic edges without enrichment
-        enriched = []
-        for e in edges:
-            enriched.append({
-                "edge_id": e["edge_id"],
-                "source_node": e["source_node"],
-                "target_node_": e["target_node"],
-                "name": e["name"],
-                "highway": e["highway"],
-                "length_m": e["length_m"],
-                "speed_kph": e["speed_kph"],
-                "dist_to_target_m": None,
-                "bearing_to_target": None,
-                "edge_bearing": None,
-                "congestion": 0,
-            })
+            # Execute each tool call
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                fn_args = tc["function"].get("arguments", {})
+                reasoning_log.append(f"[call] {fn_name}({json.dumps(fn_args)})")
 
-    if not enriched:
-        return None, None
+                result_str, is_move, node_id = execute_tool(conn, agent, fn_name, fn_args)
+                reasoning_log.append(f"[result] {result_str[:120]}")
 
-    # Current straight-line distance to target
-    current_dist = get_distance_to_target(conn, current_node, agent["target_node"])
+                # Append tool result back to conversation
+                messages.append({
+                    "role": "tool",
+                    "content": result_str,
+                })
 
-    if USE_LLM:
-        return pick_next_node_llm(conn, agent, current_node, enriched, current_dist)
-    else:
-        return pick_next_node_spatial(conn, agent, current_node, enriched, current_dist)
-
-
-def plan_move(conn, agent):
-    """
-    Plan the next move for a vehicle. Returns (next_node, edge) or (None, None).
-    Does NOT commit the move — used for conflict detection.
-    """
-    current = agent["current_node"]
-    if agent["status"] == "arrived":
-        return None, None
-    return pick_next_node(conn, agent, current)
-
-
-def get_approach_bearing(conn, agent):
-    """Get the bearing at which an agent is approaching its current node."""
-    prev = agent_prev_node.get(agent["agent_id"])
-    if prev is None:
-        return None
-    p_lon, p_lat = get_node_coords(conn, prev)
-    c_lon, c_lat = get_node_coords(conn, agent["current_node"])
-    if p_lon is None or c_lon is None:
-        return None
-    return compute_bearing(p_lon, p_lat, c_lon, c_lat)
-
-
-def resolve_give_way(conn, moves):
-    """
-    Given a dict of {agent_id: (agent, next_node, edge)}, resolve conflicts
-    at intersections using the "give way to left" rule.
-
-    When multiple vehicles want to enter the same node, a vehicle must
-    yield if another vehicle is approaching that intersection from its left.
-
-    Returns set of agent_ids that are BLOCKED this tick.
-    """
-    # Group by target node
-    by_target = defaultdict(list)
-    for agent_id, (agent, next_node, edge) in moves.items():
-        if next_node is not None:
-            by_target[next_node].append((agent_id, agent, edge))
-
-    blocked = set()
-
-    for target_node, contenders in by_target.items():
-        if len(contenders) < 2:
-            continue  # no conflict
-
-        # Compute approach bearings for each contender
-        bearings = {}
-        for agent_id, agent, edge in contenders:
-            bearing = get_approach_bearing(conn, agent)
-            if bearing is not None:
-                bearings[agent_id] = bearing
-
-        # For each pair, check give-way-to-left
-        for agent_id, agent, edge in contenders:
-            if agent_id not in bearings:
-                continue
-            my_bearing = bearings[agent_id]
-
-            for other_id, other_agent, other_edge in contenders:
-                if other_id == agent_id or other_id not in bearings:
-                    continue
-                other_bearing = bearings[other_id]
-
-                # If the other vehicle is approaching from MY left, I must give way
-                if is_approaching_from_left(my_bearing, other_bearing):
-                    blocked.add(agent_id)
+                if is_move:
+                    move_node = node_id
                     break
 
-    return blocked
+            if move_node is not None:
+                break
+
+    except Exception as e:
+        reasoning_log.append(f"[error] {e}")
+
+    # Fallback: if LLM never called move_to, pick first available road
+    if move_node is None:
+        reasoning_log.append("[fallback] picking first available road")
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT target_node FROM edges WHERE source_node = %s LIMIT 1
+                """, (agent["current_node"],))
+                row = cur.fetchone()
+                if row:
+                    move_node = row[0]
+        except Exception:
+            pass
+
+    conn.close()
+    return move_node, reasoning_log
 
 
-INITIAL_VEHICLES = [(f"car_{i:02d}", random.uniform(30.0, 60.0)) for i in range(1, 11)]
+# ─── Orchestrator (thin tick-loop) ───────────────────────────────────────────
+
+INITIAL_VEHICLES = [(f"car_{i:02d}", random.uniform(30.0, 60.0)) for i in range(1, 6)]
 
 
 def seed_vehicles(conn):
-    """
-    Insert initial vehicles with spatially-separated start/target nodes.
-    Uses ST_Distance to ensure start and target are meaningfully apart.
-    """
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM agents WHERE agent_type = 'vehicle'")
-        count = cur.fetchone()[0]
-        if count > 0:
-            return  # already seeded
-
+        if cur.fetchone()[0] > 0:
+            return
         for name, speed in INITIAL_VEHICLES:
-            # Pick start and target that are at least 500m apart
             cur.execute("""
                 WITH start_node AS (
                     SELECT node_id, geom FROM nodes ORDER BY random() LIMIT 1
@@ -567,109 +418,94 @@ def seed_vehicles(conn):
                 FROM start_node s, start_node s2
             """, (name, speed))
     conn.commit()
-    print(f"Seeded {len(INITIAL_VEHICLES)} vehicles (min 500m apart from targets).\n")
+    print(f"Seeded {len(INITIAL_VEHICLES)} vehicles.\n")
 
 
-def step_agents(conn, agents, tick):
+def resolve_conflicts(planned_moves):
     """
-    Advance all vehicles by one tick with spatial intelligence and conflict resolution.
-    Uses ThreadPoolExecutor to parallelize LLM calls across vehicles.
+    If multiple vehicles want the same node, only the first one gets it.
+    Others are blocked this tick. (Simple conflict resolution.)
     """
-    # Phase 1: Plan moves for all agents (parallelized)
-    active_agents = [a for a in agents if a["status"] != "arrived"]
-    arrived_agents = [a for a in agents if a["status"] == "arrived"]
-
-    for agent in arrived_agents:
-        print(f"  [{agent['name']}] Already arrived at destination")
-
-    def plan_for_agent(agent):
-        """Plan move for a single agent using its own DB connection."""
-        thread_conn = get_connection()
-        try:
-            next_node, edge = plan_move(thread_conn, agent)
-            return agent, next_node, edge
-        finally:
-            thread_conn.close()
-
-    planned_moves = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(plan_for_agent, a): a for a in active_agents}
-        for future in as_completed(futures):
-            agent, next_node, edge = future.result()
-            if next_node is None:
-                print(f"  [{agent['name']}] STUCK at node {agent['current_node']} -- no outgoing edges")
-            else:
-                planned_moves[agent["agent_id"]] = (agent, next_node, edge)
-
-    # Phase 2: Resolve give-way conflicts
-    blocked = resolve_give_way(conn, planned_moves)
-
-    # Phase 3: Execute non-blocked moves
-    for agent_id, (agent, next_node, edge) in planned_moves.items():
-        name = agent["name"]
-        current = agent["current_node"]
-
-        if agent_id in blocked:
-            print(f"  [{name}] YIELDING at node {current} (give way to left)")
+    targets_seen = {}
+    blocked = set()
+    for agent_id, node_id in planned_moves.items():
+        if node_id is None:
             continue
-
-        # Track previous node for bearing calculations
-        agent_prev_node[agent_id] = current
-
-        status = "moving"
-        if next_node == agent["target_node"]:
-            status = "arrived"
-
-        update_agent_position(conn, agent_id, next_node, status)
-        record_trail(conn, agent_id, tick, next_node)
-
-        street = edge.get("name") or edge.get("highway") or "unnamed road"
-        length = edge.get("length_m") or 0
-        congestion = edge.get("congestion", 0)
-        dist_remaining = edge.get("dist_to_target_m")
-
-        extra = ""
-        if congestion > 0:
-            extra += f" [!{congestion} vehicles]"
-        if dist_remaining:
-            extra += f" [{dist_remaining:.0f}m to go]"
-
-        print(f"  [{name}] {current} -> {next_node} via \"{street}\" ({length:.0f}m){extra} [{status}]")
+        if node_id in targets_seen:
+            blocked.add(agent_id)  # second vehicle loses
+        else:
+            targets_seen[node_id] = agent_id
+    return blocked
 
 
 def run_simulation():
-    """Main orchestrator loop with spatial intelligence."""
+    """Main orchestrator: thin tick-loop with parallel autonomous agents."""
     conn = get_connection()
 
     print("=" * 60)
-    print("  TRAFFIC SIMULATION ORCHESTRATOR (PostGIS Spatial AI)")
+    print("  AUTONOMOUS VEHICLE SIMULATION (Tool-Calling Agents)")
     print("=" * 60)
     print()
 
     seed_vehicles(conn)
-
     agents = load_agents(conn)
-    print(f"Loaded {len(agents)} vehicles:\n")
+    print(f"Loaded {len(agents)} autonomous vehicles:\n")
     for a in agents:
-        dist = get_distance_to_target(conn, a["current_node"], a["target_node"])
+        with conn.cursor() as cur:
+            cur.execute("SELECT node_distance_m(%s, %s)", (a["current_node"], a["target_node"]))
+            dist = cur.fetchone()[0]
         dist_str = f"{dist:.0f}m" if dist else "?"
-        print(f"  - {a['name']} at node {a['current_node']} -> target {a['target_node']} ({dist_str} away)")
-
-    # Compute initial shortest-path routes for all vehicles
-    print("\nComputing shortest-path routes (pgRouting Dijkstra)...")
-    for a in agents:
-        route = compute_route(conn, a)
-        hops = len(route) if route else 0
-        print(f"  - {a['name']}: {hops} hops planned")
+        print(f"  - {a['name']}: node {a['current_node']} -> {a['target_node']} ({dist_str})")
     print()
 
     for tick in range(1, MAX_TICKS + 1):
-        print(f"--- Tick {tick:03d} {'-' * 44}")
+        print(f"{'─' * 60}")
+        print(f"  TICK {tick:03d}")
+        print(f"{'─' * 60}")
 
-        # Reload agents to get updated positions
         agents = load_agents(conn)
+        active = [a for a in agents if a["status"] != "arrived"]
 
-        step_agents(conn, agents, tick)
+        if not active:
+            print("  All vehicles arrived!")
+            break
+
+        # Run agents sequentially (Ollama serves one request at a time)
+        planned_moves = {}
+        agent_logs = {}
+
+        for agent in active:
+            node_id, log = run_vehicle_agent(agent, tick)
+            planned_moves[agent["agent_id"]] = node_id
+            agent_logs[agent["agent_id"]] = (agent, log)
+
+        # Resolve conflicts (two vehicles targeting same node)
+        blocked = resolve_conflicts(planned_moves)
+
+        # Execute moves
+        for agent_id, node_id in planned_moves.items():
+            agent, log = agent_logs[agent_id]
+            name = agent["name"]
+
+            if node_id is None:
+                print(f"  [{name}] STUCK — no valid move found")
+                for entry in log:
+                    print(f"    {entry}")
+                continue
+
+            if agent_id in blocked:
+                print(f"  [{name}] BLOCKED — another vehicle claimed node {node_id}")
+                continue
+
+            status = "arrived" if node_id == agent["target_node"] else "moving"
+            update_agent_position(conn, agent_id, node_id, status)
+            record_trail(conn, agent_id, tick, node_id)
+
+            # Print reasoning summary
+            tool_calls = [e for e in log if e.startswith("[call]")]
+            summary = ", ".join(t.replace("[call] ", "") for t in tool_calls[:3])
+            print(f"  [{name}] -> node {node_id} [{status}]")
+            print(f"    reasoning: {summary or 'direct move'}")
 
         print()
         time.sleep(TICK_INTERVAL)
@@ -680,10 +516,12 @@ def run_simulation():
     print("=" * 60)
     agents = load_agents(conn)
     for a in agents:
-        dist = get_distance_to_target(conn, a["current_node"], a["target_node"])
+        with conn.cursor() as cur:
+            cur.execute("SELECT node_distance_m(%s, %s)", (a["current_node"], a["target_node"]))
+            dist = cur.fetchone()[0]
         dist_str = f" ({dist:.0f}m remaining)" if dist and a["status"] != "arrived" else ""
-        marker = "[OK]" if a["status"] == "arrived" else "[..]"
-        print(f"  {marker} {a['name']}: node {a['current_node']} [{a['status']}]{dist_str}")
+        marker = "OK" if a["status"] == "arrived" else ".."
+        print(f"  [{marker}] {a['name']}: node {a['current_node']} [{a['status']}]{dist_str}")
 
     conn.close()
 
