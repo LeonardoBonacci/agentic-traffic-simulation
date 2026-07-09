@@ -21,10 +21,23 @@ def load_agents(conn):
 
 def record_trail(conn, agent_id, tick, node_id):
     with conn.cursor() as cur:
+        # Build the waypoint JSON object, then upsert into the JSONB array
         cur.execute("""
-            INSERT INTO agent_trails (agent_id, tick, node_id, geom)
-            VALUES (%s, %s, %s, (SELECT geom FROM nodes WHERE node_id = %s))
-        """, (agent_id, tick, node_id, node_id))
+            WITH wp AS (
+                SELECT jsonb_build_object(
+                    'tick', %s::int,
+                    'node_id', %s::bigint,
+                    'lat', ST_Y(n.geom),
+                    'lng', ST_X(n.geom),
+                    'ts', now()
+                ) AS point
+                FROM nodes n WHERE n.node_id = %s
+            )
+            INSERT INTO agent_trails (agent_id, waypoints)
+            SELECT %s, jsonb_build_array(wp.point) FROM wp
+            ON CONFLICT (agent_id) DO UPDATE
+            SET waypoints = agent_trails.waypoints || (SELECT jsonb_build_array(wp.point) FROM wp)
+        """, (tick, node_id, node_id, agent_id))
     conn.commit()
 
 

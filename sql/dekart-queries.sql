@@ -63,7 +63,7 @@ WHERE geom IS NOT NULL
 ORDER BY agents_on_edge(edge_id) DESC;
 
 -- ============================================================
--- AGENT TRAILS: animated path history
+-- AGENT TRAILS: animated path history (from JSONB waypoints)
 -- ============================================================
 SELECT
     t.agent_id::text || '_' || t.tick::text AS id,
@@ -71,7 +71,7 @@ SELECT
     t.tick,
     t.recorded_at,
     ST_AsGeoJSON(t.geom)::json AS geometry
-FROM agent_trails t
+FROM agent_trails_flat t
 JOIN agents a ON a.agent_id = t.agent_id
 WHERE t.geom IS NOT NULL
 ORDER BY t.agent_id, t.tick;

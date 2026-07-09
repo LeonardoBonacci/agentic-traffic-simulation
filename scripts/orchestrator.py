@@ -33,16 +33,23 @@ def seed_vehicles(conn):
             return
         for name, speed in INITIAL_VEHICLES:
             cur.execute("""
-                WITH start_node AS (
-                    SELECT node_id, geom FROM nodes ORDER BY random() LIMIT 1
+                WITH reachable AS (
+                    SELECT DISTINCT source_node AS node_id FROM edges
+                ),
+                start_node AS (
+                    SELECT n.node_id, n.geom
+                    FROM nodes n JOIN reachable r ON r.node_id = n.node_id
+                    ORDER BY random() LIMIT 1
+                ),
+                end_node AS (
+                    SELECT n.node_id
+                    FROM nodes n JOIN reachable r ON r.node_id = n.node_id, start_node s
+                    WHERE ST_Distance(n.geom::geography, s.geom::geography) > 300
+                    ORDER BY random() LIMIT 1
                 )
                 INSERT INTO agents (name, agent_type, current_node, target_node, speed_kmh, geom)
-                SELECT %s, 'vehicle', s.node_id,
-                       (SELECT n.node_id FROM nodes n, start_node s2
-                        WHERE ST_Distance(n.geom::geography, s2.geom::geography) > 500
-                        ORDER BY random() LIMIT 1),
-                       %s, s.geom
-                FROM start_node s, start_node s2
+                SELECT %s, 'vehicle', s.node_id, e.node_id, %s, s.geom
+                FROM start_node s, end_node e
             """, (name, speed))
     conn.commit()
     print(f"Seeded {len(INITIAL_VEHICLES)} vehicles.\n")

@@ -52,20 +52,29 @@ CREATE INDEX idx_agents_geom ON agents USING GIST (geom);
 CREATE INDEX idx_agents_node ON agents (current_node);
 
 -- ============================================================
--- AGENT TRAIL TABLE (historical positions for analytics)
+-- AGENT TRAIL TABLE (JSONB document per agent)
+-- Each row is one agent; waypoints is a JSONB array of moves:
+--   [{"tick": 1, "node_id": 123, "lat": -41.28, "lng": 174.77, "ts": "..."}, ...]
 -- ============================================================
 
 CREATE TABLE agent_trails (
-    trail_id      SERIAL PRIMARY KEY,
-    agent_id      INTEGER NOT NULL REFERENCES agents(agent_id),
-    tick          INTEGER NOT NULL,
-    node_id       BIGINT NOT NULL REFERENCES nodes(node_id),
-    geom          GEOMETRY(Point, 4326),
-    recorded_at   TIMESTAMPTZ DEFAULT now()
+    agent_id      INTEGER PRIMARY KEY REFERENCES agents(agent_id),
+    waypoints     JSONB NOT NULL DEFAULT '[]'::jsonb
 );
 
-CREATE INDEX idx_trails_agent ON agent_trails (agent_id);
-CREATE INDEX idx_trails_geom ON agent_trails USING GIST (geom);
+-- GIN index for containment queries: e.g. WHERE waypoints @> '[{"node_id": 123}]'
+CREATE INDEX idx_trails_waypoints ON agent_trails USING GIN (waypoints jsonb_path_ops);
+
+-- View: unnest waypoints back into rows for spatial queries / Dekart
+CREATE OR REPLACE VIEW agent_trails_flat AS
+SELECT
+    t.agent_id,
+    (wp->>'tick')::integer AS tick,
+    (wp->>'node_id')::bigint AS node_id,
+    ST_SetSRID(ST_MakePoint((wp->>'lng')::float, (wp->>'lat')::float), 4326) AS geom,
+    (wp->>'ts')::timestamptz AS recorded_at
+FROM agent_trails t,
+     jsonb_array_elements(t.waypoints) AS wp;
 
 -- ============================================================
 -- PUB/SUB: auto-broadcast vehicle movements via PG NOTIFY

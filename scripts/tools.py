@@ -186,7 +186,7 @@ def execute_tool(conn, agent, tool_name, args):
                 f"{'...' if len(node_ids) > 10 else ''}"), False, None
 
     elif tool_name == "query_db":
-        sql = args.get("sql", "").strip()
+        sql = args.get("sql", "").strip().rstrip(";")
         if not sql:
             return "Error: sql parameter required.", False, None
         # Security: only allow SELECT/WITH
