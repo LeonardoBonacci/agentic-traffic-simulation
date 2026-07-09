@@ -37,29 +37,15 @@ NS = {"gml": "http://graphml.graphdrawing.org/xmlns"}
 NODE_KEYS = {
     "d4": "y",
     "d5": "x",
-    "d6": "street_count",
-    "d7": "highway",
-    "d8": "junction",
 }
 
 EDGE_KEYS = {
-    "d9": "osmid",
     "d10": "highway",
-    "d11": "maxspeed",
     "d12": "name",
     "d13": "oneway",
-    "d14": "reversed",
     "d15": "length",
     "d16": "speed_kph",
-    "d17": "travel_time",
     "d18": "geometry",
-    "d19": "lanes",
-    "d20": "ref",
-    "d21": "access",
-    "d22": "bridge",
-    "d23": "width",
-    "d24": "tunnel",
-    "d25": "junction",
 }
 
 
@@ -110,16 +96,6 @@ def to_float(val: str | None) -> float | None:
         return None
 
 
-def to_int(val: str | None) -> int | None:
-    """Convert string to int, returning None on failure."""
-    if val is None:
-        return None
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return None
-
-
 def build_edge_geom(edge: dict, node_lookup: dict) -> str | None:
     """
     Build WKT geometry for an edge.
@@ -143,7 +119,7 @@ def build_edge_geom(edge: dict, node_lookup: dict) -> str | None:
 def insert_nodes(conn, nodes: list[dict]):
     """Insert all nodes into the database."""
     sql = """
-        INSERT INTO nodes (node_id, osm_highway, osm_junction, street_count, geom)
+        INSERT INTO nodes (node_id, geom)
         VALUES %s
         ON CONFLICT (node_id) DO NOTHING
     """
@@ -154,16 +130,13 @@ def insert_nodes(conn, nodes: list[dict]):
         point_wkt = f"SRID=4326;POINT({x} {y})"
         rows.append((
             n["node_id"],
-            n.get("highway"),
-            n.get("junction"),
-            to_int(n.get("street_count")),
             point_wkt,
         ))
 
     with conn.cursor() as cur:
         execute_values(
             cur, sql, rows,
-            template="(%s, %s, %s, %s, ST_GeomFromEWKT(%s))",
+            template="(%s, ST_GeomFromEWKT(%s))",
             page_size=100,
         )
     conn.commit()
@@ -174,9 +147,8 @@ def insert_edges(conn, edges: list[dict], node_lookup: dict):
     """Insert all edges into the database."""
     sql = """
         INSERT INTO edges (
-            source_node, target_node, osm_id, highway, name,
-            oneway, reversed, length_m, speed_kph, travel_time_s,
-            maxspeed, lanes, ref, access, bridge, width, tunnel, junction, geom
+            source_node, target_node, highway, name,
+            oneway, length_m, speed_kph, geom
         ) VALUES %s
     """
     rows = []
@@ -187,29 +159,18 @@ def insert_edges(conn, edges: list[dict], node_lookup: dict):
         rows.append((
             e["source"],
             e["target"],
-            e.get("osmid"),
             e.get("highway"),
             e.get("name"),
             to_bool(e.get("oneway")),
-            to_bool(e.get("reversed")),
             to_float(e.get("length")),
             to_float(e.get("speed_kph")),
-            to_float(e.get("travel_time")),
-            e.get("maxspeed"),
-            e.get("lanes"),
-            e.get("ref"),
-            e.get("access"),
-            e.get("bridge"),
-            e.get("width"),
-            e.get("tunnel"),
-            e.get("junction"),
             geom_ewkt,
         ))
 
     with conn.cursor() as cur:
         execute_values(
             cur, sql, rows,
-            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, ST_GeomFromEWKT(%s))",
+            template="(%s, %s, %s, %s, %s, %s, %s, ST_GeomFromEWKT(%s))",
             page_size=100,
         )
     conn.commit()
