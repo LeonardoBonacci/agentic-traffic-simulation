@@ -10,12 +10,15 @@ Usage:
     python3 scripts/orchestrator.py
 """
 
+import json
 import math
 import random
+import re
 import time
 from collections import defaultdict
 
 import psycopg2
+import requests
 from psycopg2.extras import RealDictCursor
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -30,6 +33,28 @@ DB_CONFIG = {
 
 TICK_INTERVAL = 1.0  # seconds between simulation steps
 MAX_TICKS = 20       # run for this many steps then stop
+
+OLLAMA_MODEL = "qwen3:8b"
+OLLAMA_URL = "http://localhost:11434/api/chat"
+USE_LLM = True  # set False to fall back to weighted-random only
+
+
+# ─── LLM helper ──────────────────────────────────────────────────────────────
+
+def llm_chat(system_prompt, user_prompt):
+    """Call Ollama chat API directly (bypasses langchain think-mode bug)."""
+    resp = requests.post(OLLAMA_URL, json={
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0.4, "num_predict": 32},
+    }, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["message"]["content"].strip()
 
 
 # ─── Database helpers ────────────────────────────────────────────────────────
@@ -247,10 +272,83 @@ def seed_vehicles(conn):
     print(f"Seeded {len(INITIAL_VEHICLES)} vehicles.\n")
 
 
+def pick_next_node_random(conn, agent, current_node, edges):
+    """
+    Fallback: weighted-random edge selection based on turn angle.
+    """
+    prev_node = agent_prev_node.get(agent["agent_id"])
+    weighted = weight_edges_with_history(conn, prev_node, current_node, edges)
+
+    total = sum(w for _, w in weighted)
+    if total == 0:
+        edge = random.choice(edges)
+    else:
+        r = random.uniform(0, total)
+        cumulative = 0
+        edge = weighted[0][0]
+        for e, w in weighted:
+            cumulative += w
+            if r <= cumulative:
+                edge = e
+                break
+
+    return edge["target_node"], edge
+
+
+def pick_next_node_llm(conn, agent, current_node, edges):
+    """
+    Use LLM to decide which edge the vehicle should take.
+    Presents road options and asks the model to choose.
+    """
+    prev_node = agent_prev_node.get(agent["agent_id"])
+
+    # Build option descriptions
+    options = []
+    for i, e in enumerate(edges):
+        street = e.get("name") or e.get("highway") or "unnamed road"
+        length = e.get("length_m", 0)
+        speed = e.get("speed_kph", "unknown")
+        options.append(f"  {i}: \"{street}\" ({length:.0f}m, speed limit {speed} km/h)")
+
+    options_text = "\n".join(options)
+
+    system_prompt = (
+        "You are a vehicle navigation AI. Pick which road to take next. "
+        "Reply with ONLY the option number (e.g. 0, 1, 2). No explanation."
+    )
+
+    context_parts = [f"Vehicle: {agent['name']}, speed: {agent['speed_kmh']} km/h"]
+    if prev_node:
+        context_parts.append(f"Came from node {prev_node}")
+    context_parts.append(f"Currently at node {current_node}")
+    context_parts.append(f"Target destination: node {agent['target_node']}")
+    context_parts.append(f"\nAvailable roads:\n{options_text}")
+    context_parts.append(f"\nWhich road? Reply with the number only.")
+
+    human_prompt = "\n".join(context_parts)
+
+    try:
+        choice_text = llm_chat(system_prompt, human_prompt)
+        # Strip any <think>...</think> tags qwen3 might emit
+        choice_text = re.sub(r"<think>.*?</think>", "", choice_text, flags=re.DOTALL).strip()
+        # Extract first number from response
+        digits = re.search(r"\d+", choice_text)
+        if digits:
+            choice = int(digits.group())
+            if 0 <= choice < len(edges):
+                edge = edges[choice]
+                return edge["target_node"], edge
+    except Exception as e:
+        print(f"    [LLM fallback] {e}")
+
+    # Fallback to weighted random
+    return pick_next_node_random(conn, agent, current_node, edges)
+
+
 def pick_next_node(conn, agent, current_node):
     """
     Pick the next node for a vehicle to move to.
-    Strategy: weight outgoing edges by turn angle (prefer straight, avoid U-turns).
+    Uses LLM decision-making when enabled, otherwise weighted-random.
     Returns (next_node, edge_info) or (None, None) if stuck.
     """
     edges = get_outgoing_edges(conn, current_node)
@@ -259,24 +357,10 @@ def pick_next_node(conn, agent, current_node):
     if not edges:
         return None, None
 
-    prev_node = agent_prev_node.get(agent["agent_id"])
-    weighted = weight_edges_with_history(conn, prev_node, current_node, edges)
-
-    # Weighted random selection
-    total = sum(w for _, w in weighted)
-    if total == 0:
-        edge = random.choice(edges)
+    if USE_LLM:
+        return pick_next_node_llm(conn, agent, current_node, edges)
     else:
-        r = random.uniform(0, total)
-        cumulative = 0
-        edge = weighted[0][0]  # fallback
-        for e, w in weighted:
-            cumulative += w
-            if r <= cumulative:
-                edge = e
-                break
-
-    return edge["target_node"], edge
+        return pick_next_node_random(conn, agent, current_node, edges)
 
 
 def plan_move(conn, agent):
